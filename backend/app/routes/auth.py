@@ -7,12 +7,13 @@ GET  /me      → returns the currently authenticated user (protected)
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.user import User
-from app.schemas.auth import TokenResponse, UserLogin
+from app.schemas.auth import TokenResponse
 from app.schemas.user import UserCreate, UserResponse
 from app.utils.jwt import create_access_token
 from app.utils.security import hash_password, verify_password
@@ -61,16 +62,22 @@ def signup(payload: UserCreate, db: Session = Depends(get_db)):
     response_model=TokenResponse,
     summary="Log in and receive a JWT",
 )
-def login(payload: UserLogin, db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
     """
-    Authenticate with email + password.
+    Authenticate with email + password (form-urlencoded).
+
+    OAuth2PasswordRequestForm uses the field name `username` — we treat that
+    value as the user's email address, matching the Swagger Authorize popup.
 
     - Returns a signed JWT access token on success
     - Raises 401 if credentials are wrong (deliberately vague to avoid enumeration)
     """
     # Fetch user — use a generic error if not found to avoid user enumeration
-    user = db.query(User).filter(User.email == payload.email).first()
-    if not user or not verify_password(payload.password, user.password):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
