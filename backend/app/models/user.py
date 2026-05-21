@@ -9,6 +9,7 @@ Columns:
 
 import uuid
 from sqlalchemy import Column, String
+from sqlalchemy.orm import relationship
 from app.db.database import Base
 
 
@@ -31,3 +32,12 @@ class User(Base):
 
     def __repr__(self):
         return f"<User id={self.id} email={self.email}>"
+
+    # ── Relationships ─────────────────────────────────────────────────────────
+    # Populated automatically by SQLAlchemy — do not set manually.
+    # back_populates mirrors Workspace.owner on the other side.
+    workspaces = relationship(
+        "Workspace",
+        back_populates="owner",
+        cascade="all, delete-orphan",  # deleting user removes their workspaces
+    )
