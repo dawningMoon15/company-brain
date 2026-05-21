@@ -10,6 +10,9 @@ Startup sequence:
 
 from fastapi import FastAPI
 
+# Auth router
+from app.routes.auth import router as auth_router
+
 # Database connection (engine + Base)
 from app.db.database import Base, engine
 
@@ -33,3 +36,7 @@ app = FastAPI(
 @app.get("/", tags=["Health"])
 def root():
     return {"message": "Company Brain API running"}
+
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+app.include_router(auth_router)
