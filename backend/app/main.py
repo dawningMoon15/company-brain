@@ -16,12 +16,16 @@ from app.routes.auth import router as auth_router
 # Workspace router
 from app.routes.workspaces import router as workspaces_router
 
+# Document router
+from app.routes.documents import router as documents_router
+
 # Database connection (engine + Base)
 from app.db.database import Base, engine
 
 # Import models so they are registered on Base before create_all runs
 import app.models.user       # noqa: F401  (side-effect import — do not remove)
 import app.models.workspace  # noqa: F401  (side-effect import — do not remove)
+import app.models.document   # noqa: F401  (side-effect import — do not remove)
 
 # ── Create tables ─────────────────────────────────────────────────────────────
 # Creates tables that don't exist yet; skips tables that are already present.
@@ -45,3 +49,4 @@ def root():
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router)
 app.include_router(workspaces_router)
+app.include_router(documents_router)

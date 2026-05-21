@@ -41,3 +41,12 @@ class User(Base):
         back_populates="owner",
         cascade="all, delete-orphan",  # deleting user removes their workspaces
     )
+
+    # Documents uploaded by this user.
+    # passive_deletes=True: the DB handles SET NULL via the FK constraint,
+    # so SQLAlchemy doesn't need to nullify these rows itself before deletion.
+    uploaded_documents = relationship(
+        "Document",
+        back_populates="uploader",
+        passive_deletes=True,
+    )

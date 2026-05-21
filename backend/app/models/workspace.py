@@ -64,5 +64,13 @@ class Workspace(Base):
     # We use back_populates (not backref) for explicit bidirectional clarity.
     owner = relationship("User", back_populates="workspaces")
 
+    # Documents that belong to this workspace.
+    # Cascade: deleting a workspace deletes all its document metadata rows.
+    documents = relationship(
+        "Document",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
+
     def __repr__(self):
         return f"<Workspace id={self.id} name={self.name!r} owner_id={self.owner_id}>"
