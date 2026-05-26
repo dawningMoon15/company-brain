@@ -1,35 +1,33 @@
 """
 document.py — SQLAlchemy ORM model for the `documents` table
 
-Stores document metadata only — no file bytes live here.
-Actual file bytes will later be stored in Supabase Storage (or S3),
-referenced by `storage_path`.
+Stores document metadata and extracted text — no file bytes live here.
+Actual file bytes live in Supabase Storage, referenced by `storage_path`.
 
 Columns:
   id           → UUID string primary key
   workspace_id → FK → workspaces.id  (document belongs to one workspace)
   uploaded_by  → FK → users.id       (who uploaded it)
   filename     → original file name shown to users
-  file_type    → MIME type or extension, e.g. "application/pdf" or "pdf"
-  storage_path → opaque path in the storage backend, e.g. "uploads/abc.pdf"
-  status       → lifecycle state: uploaded → parsing → parsed → failed
+  file_type    → MIME type, e.g. "application/pdf"
+  storage_path → canonical Supabase Storage key, e.g. "documents/ws/doc/file.pdf"
+  status       → lifecycle state: uploaded → parsed → failed
+  parsed_text  → raw extracted text from the PDF (set after parsing)
+  page_count   → number of pages in the PDF (set after parsing)
+  parsed_at    → timestamp of successful parse (set after parsing)
   created_at   → set once at insert
   updated_at   → refreshed on every write
 
-Status values (intentionally kept as a plain string for now — migrate to
-an Enum column when the pipeline stabilises):
+Status values:
   "uploaded"  → file received, not yet processed
-  "parsing"   → actively being parsed
-  "parsed"    → text extracted, ready for chunking
-  "chunking"  → chunks being created
-  "ready"     → chunks + embeddings done, searchable
-  "failed"    → processing error
+  "parsed"    → text extracted successfully, ready for chunking
+  "failed"    → processing error during parsing
 """
 
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -71,8 +69,16 @@ class Document(Base):
     storage_path = Column(Text,   nullable=False)               # e.g. "uploads/abc.pdf"
 
     # ── Processing status ─────────────────────────────────────────────────────
-    # Default is "uploaded"; the pipeline will update this as it progresses.
+    # Default is "uploaded"; updated to "parsed" or "failed" after parsing.
     status = Column(String, nullable=False, default="uploaded")
+
+    # ── Parsed content (populated by the parsing pipeline) ────────────────────
+    # parsed_text  → full extracted text from PyMuPDF; NULL until parsed
+    # page_count   → total pages in the PDF; NULL until parsed
+    # parsed_at    → UTC timestamp of successful parse; NULL until parsed
+    parsed_text = Column(Text,             nullable=True,  default=None)
+    page_count  = Column(Integer,          nullable=True,  default=None)
+    parsed_at   = Column(DateTime(timezone=True), nullable=True, default=None)
 
     # ── Timestamps ────────────────────────────────────────────────────────────
     created_at = Column(

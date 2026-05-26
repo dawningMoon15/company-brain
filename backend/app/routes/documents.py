@@ -1,11 +1,12 @@
 """
-documents.py — Document metadata CRUD + PDF upload routes
+documents.py — Document metadata CRUD + PDF upload + parsing routes
 
 All routes are JWT-protected. Workspace ownership is verified before any
 document operation — users can only touch documents inside workspaces they own.
 
 Route map:
   POST   /workspaces/{workspace_id}/upload      → upload real PDF to Supabase Storage
+  POST   /documents/{document_id}/parse         → parse uploaded PDF, extract text
   POST   /workspaces/{workspace_id}/documents   → create document metadata (JSON)
   GET    /workspaces/{workspace_id}/documents   → list documents in workspace
   GET    /documents/{document_id}               → get single document
@@ -24,7 +25,8 @@ from app.models.document import Document
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.schemas.document import DocumentCreate, DocumentResponse
-from app.services.storage import upload_pdf
+from app.services.parser import extract_text
+from app.services.storage import download_file, upload_pdf
 
 router = APIRouter(tags=["Documents"])
 
@@ -171,6 +173,94 @@ async def upload_document(
     )
 
     # ── Step 8: Return response ───────────────────────────────────────────────
+    return document
+
+
+# ── POST /documents/{document_id}/parse ────────────────────────────────────────
+@router.post(
+    "/documents/{document_id}/parse",
+    response_model=DocumentResponse,
+    summary="Parse an uploaded PDF and extract its text",
+)
+def parse_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Download a previously uploaded PDF from Supabase Storage, extract its
+    text using PyMuPDF, and persist the results.
+
+    Full flow:
+      1. Fetch document row from DB                          → 404 if missing
+      2. Verify workspace ownership                          → 403 if not owner
+      3. Download PDF bytes from Supabase Storage            → 502 if fails
+      4. Parse PDF with PyMuPDF                              → 422 if corrupt/empty
+      5. Persist: parsed_text, page_count, parsed_at
+      6. Update status to "parsed"
+      7. Return updated DocumentResponse
+
+    On any failure after fetching the document, status is set to "failed"
+    so the document never gets stuck in an intermediate state.
+    """
+    from datetime import datetime, timezone
+
+    # ── Step 1: Fetch document ──────────────────────────────────────────────────
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    # ── Step 2: Verify workspace ownership ──────────────────────────────────────
+    _get_owned_workspace(document.workspace_id, current_user, db)
+
+    logger.info(
+        "Parse requested  document_id=%r  filename=%r  storage_path=%r",
+        document.id, document.filename, document.storage_path,
+    )
+
+    # ── Step 3: Download PDF bytes from Supabase Storage ──────────────────────
+    try:
+        pdf_bytes = download_file(document.storage_path)
+    except RuntimeError as exc:
+        # Mark as failed so the user knows something went wrong
+        document.status = "failed"
+        db.commit()
+        logger.error("Download failed for document_id=%r: %s", document_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not download PDF from storage: {exc}",
+        )
+
+    # ── Step 4: Extract text with PyMuPDF ───────────────────────────────────
+    try:
+        result = extract_text(pdf_bytes)
+    except (ValueError, RuntimeError) as exc:
+        # Mark as failed — PDF is corrupt or unreadable
+        document.status = "failed"
+        db.commit()
+        logger.error("Parsing failed for document_id=%r: %s", document_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"PDF parsing failed: {exc}",
+        )
+
+    # ── Step 5 & 6: Persist results and update status ──────────────────────────
+    document.parsed_text = result.extracted_text
+    document.page_count  = result.page_count
+    document.parsed_at   = datetime.now(timezone.utc)
+    document.status      = "parsed"
+    db.commit()
+    db.refresh(document)
+
+    logger.info(
+        "Parse complete  document_id=%r  pages=%d  chars=%d  status=%r",
+        document.id, result.page_count, len(result.extracted_text), document.status,
+    )
+
+    # ── Step 7: Return updated document ─────────────────────────────────────────
     return document
 
 
