@@ -1,17 +1,21 @@
 """
-documents.py — Document metadata CRUD routes
+documents.py — Document metadata CRUD + PDF upload routes
 
 All routes are JWT-protected. Workspace ownership is verified before any
 document operation — users can only touch documents inside workspaces they own.
 
 Route map:
-  POST   /workspaces/{workspace_id}/documents   → create document metadata
+  POST   /workspaces/{workspace_id}/upload      → upload real PDF to Supabase Storage
+  POST   /workspaces/{workspace_id}/documents   → create document metadata (JSON)
   GET    /workspaces/{workspace_id}/documents   → list documents in workspace
   GET    /documents/{document_id}               → get single document
   DELETE /documents/{document_id}               → delete document metadata
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -20,8 +24,16 @@ from app.models.document import Document
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.schemas.document import DocumentCreate, DocumentResponse
+from app.services.storage import upload_pdf
 
 router = APIRouter(tags=["Documents"])
+
+# ── Module logger ─────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ── Upload constraints ────────────────────────────────────────────────────────
+MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024   # 20 MB
+ALLOWED_CONTENT_TYPE = "application/pdf"
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -55,6 +67,111 @@ def _get_owned_workspace(
         )
 
     return workspace
+
+
+# ── POST /workspaces/{workspace_id}/upload ───────────────────────────────────
+@router.post(
+    "/workspaces/{workspace_id}/upload",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a PDF file to a workspace",
+)
+async def upload_document(
+    workspace_id: str,
+    file: UploadFile = File(..., description="PDF file to upload (max 20 MB)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload a real PDF file to Supabase Storage and register its metadata.
+
+    Full flow:
+      1. Authenticate the caller via JWT                    (get_current_user)
+      2. Verify the caller owns the target workspace        (_get_owned_workspace)
+      3. Reject non-PDF content types                       → 415
+      4. Reject files larger than 20 MB                    → 413
+      5. Generate a document_id and build the storage path
+      6. Upload bytes to Supabase Storage                  → 502 on failure
+      7. Persist a Document metadata row (status=uploaded)
+      8. Return the DocumentResponse
+
+    Storage path format:
+      {workspace_id}/{document_id}/{original_filename}
+    """
+    # ── Step 1 & 2: Auth + ownership ──────────────────────────────────────────
+    _get_owned_workspace(workspace_id, current_user, db)
+
+    # ── Step 3: MIME type validation ──────────────────────────────────────────
+    if file.content_type != ALLOWED_CONTENT_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"Only PDF files are accepted. "
+                f"Received content type: '{file.content_type}'"
+            ),
+        )
+
+    # ── Step 4: Read bytes + size validation ──────────────────────────────────
+    file_bytes = await file.read()
+    logger.info(
+        "Upload request  workspace=%r  filename=%r  content_type=%r  size=%d bytes",
+        workspace_id, file.filename, file.content_type, len(file_bytes),
+    )
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds the 20 MB limit ({len(file_bytes):,} bytes received).",
+        )
+    if len(file_bytes) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    # ── Step 5: Generate IDs and build storage path ───────────────────────────
+    document_id   = str(uuid.uuid4())
+    # Sanitise the filename to prevent path-traversal characters
+    safe_filename = file.filename.replace("/", "_").replace("..", "_")
+    intended_path = f"{workspace_id}/{document_id}/{safe_filename}"
+    logger.info("Intended storage path: %r", intended_path)
+
+    # ── Step 6: Upload to Supabase Storage ────────────────────────────────────
+    # IMPORTANT: upload_pdf() returns the canonical full_path that Supabase
+    # recorded (e.g. "documents/workspace/doc/file.pdf"). We must use THAT
+    # value in the DB row — not our locally-constructed intended_path —
+    # so that storage_path in the DB always matches the real object location.
+    try:
+        confirmed_storage_path = upload_pdf(file_bytes, intended_path)
+    except RuntimeError as exc:
+        logger.error("Storage upload failed, NOT creating metadata row. Error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Storage upload failed: {exc}",
+        )
+
+    logger.info("Confirmed storage path from Supabase: %r", confirmed_storage_path)
+
+    # ── Step 7: Persist metadata row (only after confirmed upload) ────────────
+    document = Document(
+        id=document_id,
+        workspace_id=workspace_id,
+        uploaded_by=current_user.id,
+        filename=safe_filename,
+        file_type="application/pdf",
+        storage_path=confirmed_storage_path,   # ← Supabase's canonical key
+        status="uploaded",
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    logger.info(
+        "Document metadata created  id=%r  storage_path=%r",
+        document.id, document.storage_path,
+    )
+
+    # ── Step 8: Return response ───────────────────────────────────────────────
+    return document
 
 
 # ── POST /workspaces/{workspace_id}/documents ─────────────────────────────────
@@ -169,8 +286,9 @@ def delete_document(
     - 403 if the document's workspace belongs to a different user
     - Returns 204 No Content on success (no body)
 
-    Note: this only removes the metadata row. Deleting the actual file from
-    storage will be wired up when the upload pipeline is implemented.
+    Note: this only removes the metadata row from the database.
+    Deleting the corresponding file from Supabase Storage is a future
+    enhancement (requires the storage_path to be passed to storage.delete()).
     """
     document = db.query(Document).filter(Document.id == document_id).first()
 

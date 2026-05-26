@@ -8,7 +8,16 @@ Startup sequence:
   4. Mount all routers (routes added here as the app grows)
 """
 
+import logging
+
 from fastapi import FastAPI
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Show INFO-level logs from our own modules in the uvicorn console.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s  %(name)s  %(message)s",
+)
 
 # Auth router
 from app.routes.auth import router as auth_router
